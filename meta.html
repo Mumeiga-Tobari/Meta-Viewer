@@ -381,23 +381,47 @@
             // Find all samplers
             const samplers = Object.values(promptJson).filter(n => n.class_type && (n.class_type.includes("Sampler") || n.class_type === "KSamplerAdvanced"));
             
-            function traceText(nodeId, promptJson, visited = new Set()) {
+            function traceText(nodeId, promptJson, isNegative, visited = new Set()) {
                 if (!nodeId || visited.has(nodeId)) return "";
                 visited.add(nodeId);
                 let node = promptJson[nodeId];
                 if (!node) return "";
                 
-                if (node.class_type && node.class_type.includes("CLIPTextEncode")) {
-                    return node.inputs.text || node.inputs.text_g || node.inputs.text_l || "";
+                const classType = node.class_type || "";
+                const isClip = classType.includes("CLIPTextEncode") || classType.includes("Conditioning");
+                const isTextInput = classType.includes("Text") || classType.includes("Prompt") || 
+                                    classType.includes("Primitive") || classType.includes("String") ||
+                                    classType.includes("Wildcard");
+
+                if (node.inputs && (isClip || isTextInput)) {
+                    const keysToCheck = ["text", "string", "value", "populated_text", "wildcard_text"];
+                    for (let k of keysToCheck) {
+                        if (node.inputs[k] !== undefined && typeof node.inputs[k] === "string" && node.inputs[k].trim() !== "") {
+                            return node.inputs[k];
+                        }
+                    }
                 }
                 
                 let texts = [];
                 if (node.inputs) {
-                    for (let key in node.inputs) {
+                    // Sort input keys to ensure consistent order (e.g. text1, text2...)
+                    const keys = Object.keys(node.inputs).sort();
+                    for (let key of keys) {
+                        // Skip positive/negative branches depending on mode
+                        if (isNegative) {
+                            if (/^positive/i.test(key) || /^pos/i.test(key) || /^opt_positive/i.test(key)) {
+                                continue;
+                            }
+                        } else {
+                            if (/^negative/i.test(key) || /^neg/i.test(key) || /^uc/i.test(key)) {
+                                continue;
+                            }
+                        }
+
                         let val = node.inputs[key];
                         // If input is a link to another node [node_id, output_index]
                         if (Array.isArray(val) && val.length > 0 && promptJson[val[0]]) {
-                            let t = traceText(val[0], promptJson, visited);
+                            let t = traceText(val[0], promptJson, isNegative, visited);
                             if (t) texts.push(t);
                         }
                     }
@@ -410,11 +434,11 @@
                 let sampler = samplers[samplers.length - 1]; 
                 if (sampler.inputs) {
                     if (sampler.inputs.positive && Array.isArray(sampler.inputs.positive)) {
-                        let text = traceText(sampler.inputs.positive[0], promptJson);
+                        let text = traceText(sampler.inputs.positive[0], promptJson, false);
                         if (text) positive.push(text);
                     }
                     if (sampler.inputs.negative && Array.isArray(sampler.inputs.negative)) {
-                        let text = traceText(sampler.inputs.negative[0], promptJson);
+                        let text = traceText(sampler.inputs.negative[0], promptJson, true);
                         if (text) negative.push(text);
                     }
                     if (sampler.inputs.seed !== undefined) extra.seed = sampler.inputs.seed;
