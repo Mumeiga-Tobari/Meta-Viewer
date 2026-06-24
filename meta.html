@@ -900,7 +900,7 @@
                 
                 // standard metadata not found, try stealth metadata (steganography)
                 if (!meta.prompt && !meta.negative) {
-                    const stealthText = await extractStealthMetadata(file);
+                    const stealthText = await extractStealthMetadataBinary(currentFileBuffer);
                     if (stealthText) {
                         meta = parseStealthText(stealthText);
                     }
@@ -927,99 +927,175 @@
             reader.readAsArrayBuffer(file);
         }
 
-        // Stealth PNGInfo Steganography Decoder
-        function extractStealthMetadata(file) {
-            return new Promise((resolve) => {
-                const img = new Image();
-                img.onload = async function() {
-                    try {
-                        const canvas = document.createElement('canvas');
-                        canvas.width = img.naturalWidth;
-                        canvas.height = img.naturalHeight;
-                        const ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0);
-                        
-                        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                        const data = imgData.data; // RGBA
-                        
-                        // Extract all LSBs from the Alpha channel
-                        const bits = [];
-                        for (let i = 3; i < data.length; i += 4) {
-                            bits.push(data[i] & 1);
+        // Stealth PNGInfo Steganography Decoder (Binary-level)
+        async function extractStealthMetadataBinary(buffer) {
+            try {
+                const dataView = new DataView(buffer);
+                const asciiDecoder = new TextDecoder("ascii");
+                const decoder = new TextDecoder("utf-8");
+                
+                if (dataView.getUint32(0) !== 0x89504E47) {
+                    return null;
+                }
+                
+                let offset = 8;
+                let width = 0;
+                let height = 0;
+                let colorType = 0;
+                let depth = 0;
+                let idatChunks = [];
+                
+                while (offset < buffer.byteLength) {
+                    const length = dataView.getUint32(offset);
+                    const type = asciiDecoder.decode(buffer.slice(offset + 4, offset + 8));
+                    
+                    if (type === "IHDR") {
+                        width = dataView.getUint32(offset + 8);
+                        height = dataView.getUint32(offset + 12);
+                        depth = dataView.getUint8(offset + 16);
+                        colorType = dataView.getUint8(offset + 17);
+                        if (colorType !== 6 || depth !== 8) {
+                            return null;
                         }
-                        
-                        function bitsToBytes(bitArray) {
-                            const bytes = new Uint8Array(Math.floor(bitArray.length / 8));
-                            for (let i = 0; i < bytes.length; i++) {
-                                let byteVal = 0;
-                                for (let b = 0; b < 8; b++) {
-                                    byteVal = (byteVal << 1) | bitArray[i * 8 + b];
-                                }
-                                bytes[i] = byteVal;
-                            }
-                            return bytes;
-                        }
-                        
-                        if (bits.length < 120 + 32) {
-                            resolve(null);
-                            return;
-                        }
-                        
-                        const sigBytes = bitsToBytes(bits.slice(0, 120));
-                        const decoder = new TextDecoder("utf-8");
-                        const signature = decoder.decode(sigBytes);
-                        
-                        const validSigs = ["stealth_pnginfo", "stealth_pngcomp", "stealth_rgbinfo", "stealth_rgbcomp"];
-                        if (!validSigs.includes(signature)) {
-                            resolve(null);
-                            return;
-                        }
-                        
-                        let dataLen = 0;
-                        for (let b = 0; b < 32; b++) {
-                            dataLen = (dataLen << 1) | bits[120 + b];
-                        }
-                        
-                        if (bits.length < 120 + 32 + dataLen) {
-                            resolve(null);
-                            return;
-                        }
-                        
-                        const dataBytes = bitsToBytes(bits.slice(120 + 32, 120 + 32 + dataLen));
-                        let decodedText = "";
-                        
-                        if (signature.includes("comp")) {
-                            try {
-                                const ds = new DecompressionStream("gzip");
-                                const decompressedStream = new Response(dataBytes).body.pipeThrough(ds);
-                                const blob = await new Response(decompressedStream).blob();
-                                const decompressedBuffer = await blob.arrayBuffer();
-                                decodedText = decoder.decode(decompressedBuffer);
-                            } catch(err) {
-                                alert("Stealth Gzip decompression failed: " + err.message);
-                                console.error("Stealth Gzip decompression failed", err);
-                                resolve(null);
-                                return;
-                            }
-                        } else {
-                            decodedText = decoder.decode(dataBytes);
-                        }
-                        
-                        resolve(decodedText);
-                    } catch (e) {
-                        alert("extractStealthMetadata exception: " + e.message + "\nStack: " + e.stack);
-                        console.error("Failed in extractStealthMetadata", e);
-                        resolve(null);
-                    } finally {
-                        URL.revokeObjectURL(img.src);
+                    } else if (type === "IDAT") {
+                        idatChunks.push(new Uint8Array(buffer.slice(offset + 8, offset + 8 + length)));
+                    } else if (type === "IEND") {
+                        break;
                     }
-                };
-                img.onerror = function(err) {
-                    alert("Image load failed for stealth metadata extraction: " + JSON.stringify(err));
-                    resolve(null);
-                };
-                img.src = URL.createObjectURL(file);
-            });
+                    offset += 12 + length;
+                }
+                
+                if (idatChunks.length === 0 || width === 0 || height === 0) {
+                    return null;
+                }
+                
+                let totalIdatLength = idatChunks.reduce((acc, chunk) => acc + chunk.length, 0);
+                let idatBuffer = new Uint8Array(totalIdatLength);
+                let pos = 0;
+                for (let chunk of idatChunks) {
+                    idatBuffer.set(chunk, pos);
+                    pos += chunk.length;
+                }
+                
+                let decompressedData;
+                try {
+                    const ds = new DecompressionStream("deflate");
+                    const decompressedStream = new Response(idatBuffer).body.pipeThrough(ds);
+                    const blob = await new Response(decompressedStream).blob();
+                    const arrayBuf = await blob.arrayBuffer();
+                    decompressedData = new Uint8Array(arrayBuf);
+                } catch (err) {
+                    console.error("Zlib decompression of IDAT failed", err);
+                    return null;
+                }
+                
+                const bpp = 4;
+                const stride = 1 + width * bpp;
+                const expectedLength = height * stride;
+                if (decompressedData.length < expectedLength) {
+                    return null;
+                }
+                
+                const pixels = new Uint8Array(width * height * bpp);
+                
+                for (let y = 0; y < height; y++) {
+                    const filterType = decompressedData[y * stride];
+                    const lineStart = y * stride + 1;
+                    const outLineStart = y * width * bpp;
+                    
+                    for (let x = 0; x < width * bpp; x++) {
+                        const rawVal = decompressedData[lineStart + x];
+                        const left = (x >= bpp) ? pixels[outLineStart + x - bpp] : 0;
+                        const up = (y > 0) ? pixels[(y - 1) * width * bpp + x] : 0;
+                        const upLeft = (y > 0 && x >= bpp) ? pixels[(y - 1) * width * bpp + x - bpp] : 0;
+                        
+                        let reconVal = 0;
+                        if (filterType === 0) {
+                            reconVal = rawVal;
+                        } else if (filterType === 1) {
+                            reconVal = rawVal + left;
+                        } else if (filterType === 2) {
+                            reconVal = rawVal + up;
+                        } else if (filterType === 3) {
+                            reconVal = rawVal + Math.floor((left + up) / 2);
+                        } else if (filterType === 4) {
+                            const p = left + up - upLeft;
+                            const pa = Math.abs(p - left);
+                            const pb = Math.abs(p - up);
+                            const pc = Math.abs(p - upLeft);
+                            let pr = 0;
+                            if (pa <= pb && pa <= pc) pr = left;
+                            else if (pb <= pc) pr = up;
+                            else pr = upLeft;
+                            reconVal = rawVal + pr;
+                        } else {
+                            return null;
+                        }
+                        pixels[outLineStart + x] = reconVal & 0xFF;
+                    }
+                }
+                
+                const bits = [];
+                for (let i = 0; i < width * height; i++) {
+                    bits.push(pixels[i * 4 + 3] & 1);
+                }
+                
+                function bitsToBytes(bitArray) {
+                    const bytes = new Uint8Array(Math.floor(bitArray.length / 8));
+                    for (let i = 0; i < bytes.length; i++) {
+                        let byteVal = 0;
+                        for (let b = 0; b < 8; b++) {
+                            byteVal = (byteVal << 1) | bitArray[i * 8 + b];
+                        }
+                        bytes[i] = byteVal;
+                    }
+                    return bytes;
+                }
+                
+                if (bits.length < 120 + 32) {
+                    return null;
+                }
+                
+                const sigBytes = bitsToBytes(bits.slice(0, 120));
+                const signature = decoder.decode(sigBytes);
+                
+                const validSigs = ["stealth_pnginfo", "stealth_pngcomp", "stealth_rgbinfo", "stealth_rgbcomp"];
+                if (!validSigs.includes(signature)) {
+                    return null;
+                }
+                
+                let dataLen = 0;
+                for (let b = 0; b < 32; b++) {
+                    dataLen = (dataLen << 1) | bits[120 + b];
+                }
+                
+                if (bits.length < 120 + 32 + dataLen) {
+                    return null;
+                }
+                
+                const dataBytes = bitsToBytes(bits.slice(120 + 32, 120 + 32 + dataLen));
+                let decodedText = "";
+                
+                if (signature.includes("comp")) {
+                    try {
+                        const ds = new DecompressionStream("gzip");
+                        const decompressedStream = new Response(dataBytes).body.pipeThrough(ds);
+                        const blob = await new Response(decompressedStream).blob();
+                        const decompressedBuffer = await blob.arrayBuffer();
+                        decodedText = decoder.decode(decompressedBuffer);
+                    } catch(err) {
+                        console.error("Stealth Gzip decompression failed", err);
+                        return null;
+                    }
+                } else {
+                    decodedText = decoder.decode(dataBytes);
+                }
+                
+                return decodedText;
+            } catch (e) {
+                console.error("Failed in extractStealthMetadataBinary", e);
+                return null;
+            }
         }
 
         function parseStealthText(text) {
