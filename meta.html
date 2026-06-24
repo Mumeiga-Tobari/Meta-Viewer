@@ -484,19 +484,63 @@
                 const length = dataView.getUint32(offset);
                 const type = decoder.decode(buffer.slice(offset + 4, offset + 8));
 
-                if (type === "tEXt") {
+                if (type === "tEXt" || type === "iTXt") {
                     const chunkData = new Uint8Array(buffer.slice(offset + 8, offset + 8 + length));
-                    let nullIndex = -1;
-                    for (let i = 0; i < chunkData.length; i++) {
-                        if (chunkData[i] === 0) {
-                            nullIndex = i;
-                            break;
+                    let keyword = "";
+                    let text = "";
+
+                    if (type === "tEXt") {
+                        let nullIndex = -1;
+                        for (let i = 0; i < chunkData.length; i++) {
+                            if (chunkData[i] === 0) {
+                                nullIndex = i;
+                                break;
+                            }
+                        }
+                        if (nullIndex !== -1) {
+                            keyword = decoder.decode(chunkData.slice(0, nullIndex));
+                            text = decoder.decode(chunkData.slice(nullIndex + 1));
+                        }
+                    } else if (type === "iTXt") {
+                        let nullIndex = -1;
+                        for (let i = 0; i < chunkData.length; i++) {
+                            if (chunkData[i] === 0) {
+                                nullIndex = i;
+                                break;
+                            }
+                        }
+                        if (nullIndex !== -1) {
+                            keyword = decoder.decode(chunkData.slice(0, nullIndex));
+                            const compressionFlag = chunkData[nullIndex + 1];
+                            
+                            let langNull = -1;
+                            for (let i = nullIndex + 3; i < chunkData.length; i++) {
+                                if (chunkData[i] === 0) {
+                                    langNull = i;
+                                    break;
+                                }
+                            }
+                            if (langNull !== -1) {
+                                let transNull = -1;
+                                for (let i = langNull + 1; i < chunkData.length; i++) {
+                                    if (chunkData[i] === 0) {
+                                        transNull = i;
+                                        break;
+                                    }
+                                }
+                                if (transNull !== -1) {
+                                    const textData = chunkData.slice(transNull + 1);
+                                    if (compressionFlag === 0) {
+                                        text = decoder.decode(textData);
+                                    } else {
+                                        console.warn("Compressed iTXt chunk is not supported.");
+                                    }
+                                }
+                            }
                         }
                     }
-                    if (nullIndex !== -1) {
-                        const keyword = decoder.decode(chunkData.slice(0, nullIndex));
-                        const text = decoder.decode(chunkData.slice(nullIndex + 1));
 
+                    if (keyword && text) {
                         if (keyword === "parameters") {
                             result.source = "A1111 / WebUI";
                             const parts = text.split("Negative prompt:");
@@ -780,6 +824,7 @@
 
         let currentFileBuffer = null;
         let currentFileName = "";
+        let currentFile = null;
         let currentBatchFiles = [];
 
         const dropZone = document.getElementById('drop-zone');
@@ -840,6 +885,7 @@
                 alert("PNG, JPEG, またはWebP画像のみ対応しています"); return;
             }
             
+            currentFile = file;
             currentFileName = file.name;
 
             // Set preview directly from file
@@ -886,37 +932,64 @@
             }, 1500);
         }
 
-        // Strip Metadata Logic
-        function triggerDownload(resultBuffer, mimeType, filename) {
-            const blob = new Blob([resultBuffer], { type: mimeType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+        // Strip Metadata Logic (Stealth Metadata destruction via Canvas)
+        function cleanImageAndGetBlob(file) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = function() {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    
+                    // アルファチャンネルを255に固定してStealth PNGInfoメタデータを物理破壊
+                    try {
+                        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const data = imgData.data;
+                        for (let i = 3; i < data.length; i += 4) {
+                            data[i] = 255;
+                        }
+                        ctx.putImageData(imgData, 0, 0);
+                    } catch(e) {
+                        console.error("Alpha channel clear error", e);
+                    }
+                    
+                    canvas.toBlob(function(blob) {
+                        resolve(blob);
+                    }, file.type);
+                    URL.revokeObjectURL(img.src);
+                };
+                img.onerror = function() {
+                    // 読み込み失敗時は元のファイルをそのまま返して処理を止めない
+                    resolve(file);
+                };
+                img.src = URL.createObjectURL(file);
+            });
         }
 
-        function stripAndDownload() {
-            if (!currentFileBuffer || !currentFileName) return;
+        async function stripAndDownload() {
+            if (!currentFile || !currentFileName) return;
 
-            const strippedBuffer = stripMetadata(currentFileBuffer);
-            if (strippedBuffer) {
-                const dataView = new DataView(currentFileBuffer);
-                const isPNG = (dataView.getUint32(0) === 0x89504E47);
-                const isJPEG = (dataView.getUint16(0) === 0xFFD8);
-                const asciiDecoder = new TextDecoder("ascii");
-                const isWebP = (asciiDecoder.decode(currentFileBuffer.slice(0, 4)) === "RIFF");
-                
-                let mimeType = "application/octet-stream";
-                if (isPNG) mimeType = "image/png";
-                if (isJPEG) mimeType = "image/jpeg";
-                if (isWebP) mimeType = "image/webp";
-                
-                triggerDownload(strippedBuffer, mimeType, "stripped_" + currentFileName);
+            const btn = document.querySelector('#preview-container button.danger');
+            const originalText = btn.innerText;
+            btn.innerText = "パージ中...";
+            btn.disabled = true;
+
+            const cleanBlob = await cleanImageAndGetBlob(currentFile);
+            if (cleanBlob) {
+                const url = URL.createObjectURL(cleanBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = "stripped_" + currentFileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
             }
+
+            btn.innerText = originalText;
+            btn.disabled = false;
         }
 
         async function stripAllAndDownloadZip() {
@@ -930,14 +1003,8 @@
             
             for (let i = 0; i < currentBatchFiles.length; i++) {
                 const file = currentBatchFiles[i];
-                const buffer = await file.arrayBuffer();
-                const strippedBuffer = stripMetadata(buffer);
-                
-                if (strippedBuffer) {
-                    zip.file("stripped_" + file.name, strippedBuffer);
-                } else {
-                    zip.file(file.name, buffer);
-                }
+                const cleanBlob = await cleanImageAndGetBlob(file);
+                zip.file("stripped_" + file.name, cleanBlob);
             }
             
             zip.generateAsync({ type: "blob" }).then(function(content) {
@@ -964,132 +1031,23 @@
 
             for (let i = 0; i < currentBatchFiles.length; i++) {
                 const file = currentBatchFiles[i];
-                const buffer = await file.arrayBuffer();
-                const strippedBuffer = stripMetadata(buffer);
+                const cleanBlob = await cleanImageAndGetBlob(file);
                 
-                const dataView = new DataView(buffer);
-                const isPNG = (dataView.getUint32(0) === 0x89504E47);
-                const isJPEG = (dataView.getUint16(0) === 0xFFD8);
-                const asciiDecoder = new TextDecoder("ascii");
-                const isWebP = (asciiDecoder.decode(buffer.slice(0, 4)) === "RIFF");
+                const url = URL.createObjectURL(cleanBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = "stripped_" + file.name;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
                 
-                let mimeType = "application/octet-stream";
-                if (isPNG) mimeType = "image/png";
-                if (isJPEG) mimeType = "image/jpeg";
-                if (isWebP) mimeType = "image/webp";
-                
-                if (strippedBuffer) {
-                    triggerDownload(strippedBuffer, mimeType, "stripped_" + file.name);
-                } else {
-                    triggerDownload(buffer, mimeType, file.name);
-                }
-                
-                // ブラウザの同時ダウンロード制限やポップアップブロックを回避するため、300msのディレイを設定
+                // 同時ダウンロードブロック回避ディレイ
                 await new Promise(resolve => setTimeout(resolve, 300));
             }
             
             btn.innerText = "一括パージして個別保存";
             btn.disabled = false;
-        }
-
-        function stripMetadata(buffer) {
-            const dataView = new DataView(buffer);
-            
-            const isPNG = (dataView.getUint32(0) === 0x89504E47);
-            const isJPEG = (dataView.getUint16(0) === 0xFFD8);
-            const asciiDecoder = new TextDecoder("ascii");
-            const isWebP = (asciiDecoder.decode(buffer.slice(0, 4)) === "RIFF");
-
-            if (isPNG) {
-                const signature = buffer.slice(0, 8);
-                let offset = 8;
-                const decoder = new TextDecoder("ascii");
-                const keepChunks = ["IHDR", "PLTE", "IDAT", "IEND", "tRNS", "cHRM", "gAMA", "sRGB"];
-                let newChunks = [];
-                newChunks.push(new Uint8Array(signature));
-
-                while (offset < buffer.byteLength) {
-                    const length = dataView.getUint32(offset);
-                    const type = decoder.decode(buffer.slice(offset + 4, offset + 8));
-                    if (keepChunks.includes(type)) {
-                        newChunks.push(new Uint8Array(buffer.slice(offset, offset + 12 + length)));
-                    }
-                    if (type === "IEND") break;
-                    offset += 12 + length;
-                }
-
-                let totalLength = newChunks.reduce((acc, val) => acc + val.length, 0);
-                let resultBuffer = new Uint8Array(totalLength);
-                let pos = 0;
-                for (let chunk of newChunks) {
-                    resultBuffer.set(chunk, pos);
-                    pos += chunk.length;
-                }
-                return resultBuffer;
-            } else if (isJPEG) {
-                let offset = 2;
-                let newChunks = [];
-                newChunks.push(new Uint8Array(buffer.slice(0, 2))); // FF D8
-                
-                while (offset < buffer.byteLength) {
-                    if (dataView.getUint8(offset) !== 0xFF) break;
-                    let marker = dataView.getUint8(offset + 1);
-                    
-                    if (marker === 0xDA) { // SOS
-                        newChunks.push(new Uint8Array(buffer.slice(offset)));
-                        break;
-                    }
-
-                    let length = dataView.getUint16(offset + 2);
-                    
-                    if (!(marker >= 0xE1 && marker <= 0xEF) && marker !== 0xFE) {
-                        newChunks.push(new Uint8Array(buffer.slice(offset, offset + 2 + length)));
-                    }
-                    
-                    offset += 2 + length;
-                }
-                
-                let totalLength = newChunks.reduce((acc, val) => acc + val.length, 0);
-                let resultBuffer = new Uint8Array(totalLength);
-                let pos = 0;
-                for (let chunk of newChunks) {
-                    resultBuffer.set(chunk, pos);
-                    pos += chunk.length;
-                }
-                return resultBuffer;
-            } else if (isWebP) {
-                const decoder = new TextDecoder("ascii");
-                let offset = 12; // skip RIFF + size + WEBP
-                
-                let newChunks = [];
-                newChunks.push(new Uint8Array(buffer.slice(0, 12))); // header
-                
-                while (offset < buffer.byteLength) {
-                    let chunkId = decoder.decode(buffer.slice(offset, offset + 4));
-                    let chunkSize = dataView.getUint32(offset + 4, true);
-                    let padding = (chunkSize % 2 !== 0) ? 1 : 0;
-                    
-                    if (chunkId !== "EXIF" && chunkId !== "XMP ") {
-                        newChunks.push(new Uint8Array(buffer.slice(offset, offset + 8 + chunkSize + padding)));
-                    }
-                    
-                    offset += 8 + chunkSize + padding;
-                }
-                
-                let totalLength = newChunks.reduce((acc, val) => acc + val.length, 0);
-                let resultBuffer = new Uint8Array(totalLength);
-                let pos = 0;
-                for (let chunk of newChunks) {
-                    resultBuffer.set(chunk, pos);
-                    pos += chunk.length;
-                }
-                
-                let resDataView = new DataView(resultBuffer.buffer);
-                resDataView.setUint32(4, totalLength - 8, true);
-                
-                return resultBuffer;
-            }
-            return null;
         }
     </script>
 
