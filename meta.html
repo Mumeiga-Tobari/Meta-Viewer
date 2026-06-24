@@ -245,7 +245,7 @@
 
     <div class="container">
         <h1>NAI / SD / ComfyUI Meta Viewer</h1>
-        <div class="version">v4.2 (NAI Latest Specs + Stealth)</div>
+        <div class="version">v4.2.1 (NAI Latest Specs + Stealth)</div>
 
         <div id="drop-zone">
             <p>ここにNovelAI / SD / ComfyUIの画像をドラッグ＆ドロップしてください<br>(PNG / JPEG / WebP 対応。クリックでファイル選択)</p>
@@ -1036,8 +1036,10 @@
                 }
                 
                 const bits = [];
-                for (let i = 0; i < width * height; i++) {
-                    bits.push(pixels[i * 4 + 3] & 1);
+                for (let x = 0; x < width; x++) {
+                    for (let y = 0; y < height; y++) {
+                        bits.push(pixels[(y * width + x) * 4 + 3] & 1);
+                    }
                 }
                 
                 function bitsToBytes(bitArray) {
