@@ -245,7 +245,7 @@
 
     <div class="container">
         <h1>NAI / SD / ComfyUI Meta Viewer</h1>
-        <div class="version">v4.1 (NAI Latest Specs)</div>
+        <div class="version">v4.2 (NAI Latest Specs + Stealth)</div>
 
         <div id="drop-zone">
             <p>ここにNovelAI / SD / ComfyUIの画像をドラッグ＆ドロップしてください<br>(PNG / JPEG / WebP 対応。クリックでファイル選択)</p>
@@ -894,11 +894,19 @@
             document.getElementById('preview-container').style.display = "flex";
 
             const reader = new FileReader();
-            reader.onload = function (e) {
+            reader.onload = async function (e) {
                 currentFileBuffer = e.target.result;
-                const { prompt, negative, extra, source, characters } = extractExampleMetadata(currentFileBuffer);
+                let meta = extractExampleMetadata(currentFileBuffer);
                 
-                if (!prompt && !negative) {
+                // standard metadata not found, try stealth metadata (steganography)
+                if (!meta.prompt && !meta.negative) {
+                    const stealthText = await extractStealthMetadata(file);
+                    if (stealthText) {
+                        meta = parseStealthText(stealthText);
+                    }
+                }
+                
+                if (!meta.prompt && !meta.negative) {
                     // Reset fields
                     document.getElementById('positive-output').value = "";
                     document.getElementById('negative-output').value = "";
@@ -908,15 +916,152 @@
                     return;
                 }
 
-                document.getElementById('positive-output').value = prompt;
-                document.getElementById('negative-output').value = negative;
+                document.getElementById('positive-output').value = meta.prompt;
+                document.getElementById('negative-output').value = meta.negative;
 
                 // Render character prompts (NAI V4)
-                renderCharacters(characters);
+                renderCharacters(meta.characters);
 
-                renderMetadata(extra, source);
+                renderMetadata(meta.extra, meta.source);
             };
             reader.readAsArrayBuffer(file);
+        }
+
+        // Stealth PNGInfo Steganography Decoder
+        function extractStealthMetadata(file) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = async function() {
+                    try {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = img.naturalWidth;
+                        canvas.height = img.naturalHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+                        
+                        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const data = imgData.data; // RGBA
+                        
+                        // Extract all LSBs from the Alpha channel
+                        const bits = [];
+                        for (let i = 3; i < data.length; i += 4) {
+                            bits.push(data[i] & 1);
+                        }
+                        
+                        function bitsToBytes(bitArray) {
+                            const bytes = new Uint8Array(Math.floor(bitArray.length / 8));
+                            for (let i = 0; i < bytes.length; i++) {
+                                let byteVal = 0;
+                                for (let b = 0; b < 8; b++) {
+                                    byteVal = (byteVal << 1) | bitArray[i * 8 + b];
+                                }
+                                bytes[i] = byteVal;
+                            }
+                            return bytes;
+                        }
+                        
+                        if (bits.length < 120 + 32) {
+                            resolve(null);
+                            return;
+                        }
+                        
+                        const sigBytes = bitsToBytes(bits.slice(0, 120));
+                        const decoder = new TextDecoder("utf-8");
+                        const signature = decoder.decode(sigBytes);
+                        
+                        const validSigs = ["stealth_pnginfo", "stealth_pngcomp", "stealth_rgbinfo", "stealth_rgbcomp"];
+                        if (!validSigs.includes(signature)) {
+                            resolve(null);
+                            return;
+                        }
+                        
+                        let dataLen = 0;
+                        for (let b = 0; b < 32; b++) {
+                            dataLen = (dataLen << 1) | bits[120 + b];
+                        }
+                        
+                        if (bits.length < 120 + 32 + dataLen) {
+                            resolve(null);
+                            return;
+                        }
+                        
+                        const dataBytes = bitsToBytes(bits.slice(120 + 32, 120 + 32 + dataLen));
+                        let decodedText = "";
+                        
+                        if (signature.includes("comp")) {
+                            try {
+                                const ds = new DecompressionStream("gzip");
+                                const decompressedStream = new Response(dataBytes).body.pipeThrough(ds);
+                                const blob = await new Response(decompressedStream).blob();
+                                const decompressedBuffer = await blob.arrayBuffer();
+                                decodedText = decoder.decode(decompressedBuffer);
+                            } catch(err) {
+                                alert("Stealth Gzip decompression failed: " + err.message);
+                                console.error("Stealth Gzip decompression failed", err);
+                                resolve(null);
+                                return;
+                            }
+                        } else {
+                            decodedText = decoder.decode(dataBytes);
+                        }
+                        
+                        resolve(decodedText);
+                    } catch (e) {
+                        alert("extractStealthMetadata exception: " + e.message + "\nStack: " + e.stack);
+                        console.error("Failed in extractStealthMetadata", e);
+                        resolve(null);
+                    } finally {
+                        URL.revokeObjectURL(img.src);
+                    }
+                };
+                img.onerror = function(err) {
+                    alert("Image load failed for stealth metadata extraction: " + JSON.stringify(err));
+                    resolve(null);
+                };
+                img.src = URL.createObjectURL(file);
+            });
+        }
+
+        function parseStealthText(text) {
+            let result = { prompt: "", negative: "", extra: {}, source: "Unknown", characters: [] };
+            try {
+                const json = JSON.parse(text);
+                
+                if (json.Comment) {
+                    try {
+                        const inner = JSON.parse(json.Comment);
+                        result.prompt = inner.prompt || "";
+                        result.negative = inner.uc || "";
+                        result.extra = inner;
+                        result.source = "NovelAI (Stealth)";
+                        result.characters = extractCharacterPrompts(inner);
+                    } catch(e) {
+                        console.error("Failed to parse inner Comment JSON in stealth", e);
+                    }
+                } else if (json.prompt) {
+                    result.prompt = json.prompt || "";
+                    result.negative = json.uc || json.negative || "";
+                    result.extra = json;
+                    result.source = "Stealth";
+                }
+                
+                if (json.Description && !result.prompt) {
+                    result.prompt = json.Description;
+                }
+                if (json.Software) {
+                    result.extra["Software"] = json.Software;
+                    if (json.Software.includes("NovelAI")) result.source = "NovelAI (Stealth)";
+                }
+                if (json.Source) {
+                    result.extra["Source"] = json.Source;
+                }
+                if (json.Title) {
+                    result.extra["Title"] = json.Title;
+                }
+            } catch(e) {
+                parsePayloadText(text, result, "Stealth");
+            }
+            return result;
         }
 
         function copyToClipboard(elementId, btn) {
