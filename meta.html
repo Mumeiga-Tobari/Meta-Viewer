@@ -245,7 +245,7 @@
 
     <div class="container">
         <h1>NAI / SD / ComfyUI Meta Viewer</h1>
-        <div class="version">v4.2.1 (NAI Latest Specs + Stealth)</div>
+        <div class="version">v4.2.2 (NAI Latest Specs + Stealth)</div>
 
         <div id="drop-zone">
             <p>ここにNovelAI / SD / ComfyUIの画像をドラッグ＆ドロップしてください<br>(PNG / JPEG / WebP 対応。クリックでファイル選択)</p>
@@ -929,6 +929,31 @@
 
         // Stealth PNGInfo Steganography Decoder (Binary-level)
         async function extractStealthMetadataBinary(buffer) {
+            async function decompressBuffer(bytes, format) {
+                const ds = new DecompressionStream(format);
+                const writer = ds.writable.getWriter();
+                writer.write(bytes);
+                writer.close();
+                
+                const reader = ds.readable.getReader();
+                const chunks = [];
+                let totalLength = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    totalLength += value.length;
+                }
+                
+                const result = new Uint8Array(totalLength);
+                let offset = 0;
+                for (const chunk of chunks) {
+                    result.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                return result;
+            }
+
             try {
                 const dataView = new DataView(buffer);
                 const asciiDecoder = new TextDecoder("ascii");
@@ -979,13 +1004,10 @@
                 
                 let decompressedData;
                 try {
-                    const ds = new DecompressionStream("deflate");
-                    const decompressedStream = new Response(idatBuffer).body.pipeThrough(ds);
-                    const blob = await new Response(decompressedStream).blob();
-                    const arrayBuf = await blob.arrayBuffer();
-                    decompressedData = new Uint8Array(arrayBuf);
+                    decompressedData = await decompressBuffer(idatBuffer, "deflate");
                 } catch (err) {
                     console.error("Zlib decompression of IDAT failed", err);
+                    alert("Zlib decompression of IDAT failed: " + err.message);
                     return null;
                 }
                 
@@ -1080,13 +1102,11 @@
                 
                 if (signature.includes("comp")) {
                     try {
-                        const ds = new DecompressionStream("gzip");
-                        const decompressedStream = new Response(dataBytes).body.pipeThrough(ds);
-                        const blob = await new Response(decompressedStream).blob();
-                        const decompressedBuffer = await blob.arrayBuffer();
+                        const decompressedBuffer = await decompressBuffer(dataBytes, "gzip");
                         decodedText = decoder.decode(decompressedBuffer);
                     } catch(err) {
                         console.error("Stealth Gzip decompression failed", err);
+                        alert("Stealth Gzip decompression failed: " + err.message);
                         return null;
                     }
                 } else {
